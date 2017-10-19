@@ -2,6 +2,7 @@
 
 module Main where
 
+import Cli
 import Sos.FileEvent
 import Sos.Job
 import Sos.Rule
@@ -20,7 +21,6 @@ import Data.ByteString (ByteString)
 import Data.List.NonEmpty (NonEmpty(..))
 import Data.Monoid
 import Data.Yaml (decodeFileEither, prettyPrintParseException)
-import Options.Applicative
 import Streaming
 import System.Directory
 import System.Exit
@@ -31,17 +31,6 @@ import Text.Regex.TDFA (match)
 import qualified Streaming.Prelude as S
 import qualified System.FSNotify.Streaming as FSNotify
 
-version :: String
-version = "Steel Overseer 2.0.2"
-
-data Options = Options
-  { optTarget   :: FilePath
-  , optRCFile   :: FilePath
-  , optCommands :: [RawTemplate]
-  , optPatterns :: [RawPattern]
-  , optExcludes :: [RawPattern]
-  } deriving Show
-
 -- The concurrent sources of input to the main worker thread.
 data Input
   = JobToEnqueue Job
@@ -49,71 +38,44 @@ data Input
   | JobResult Job (Maybe SomeException)
 
 main :: IO ()
-main = execParser opts >>= main'
- where
-  opts = info (helper <*> optsParser)
-    ( fullDesc
-   <> progDesc "A file watcher and development tool."
-   <> header version )
+main = cliMain main'
 
-  optsParser :: Parser Options
-  optsParser = Options
-    <$> strArgument
-     ( help "Optional file or directory to watch for changes."
-       <> metavar "TARGET"
-       <> value "."
-       <> showDefault )
-    <*> strOption
-     ( help "Optional rcfile to read patterns and commands from."
-       <> long "rcfile"
-       <> value ".sosrc"
-       <> showDefault )
-    <*> many (fmap packBS (strOption
-      ( long "command"
-        <> short 'c'
-        <> help "Add command to run on file event."
-        <> metavar "COMMAND" )))
-    <*> many (fmap packBS (strOption
-      ( long "pattern"
-        <> short 'p'
-        <> help "Add pattern to match on file path. Only relevant if the target is a directory. (default: .*)"
-        <> metavar "PATTERN" )))
-    <*> many (fmap packBS (strOption
-      ( long "exclude"
-        <> short 'e'
-        <> help "Add pattern to exclude matches on file path. Only relevant if the target is a directory."
-        <> metavar "PATTERN" )))
-
-main' :: Options -> IO ()
-main' Options{..} = do
+main'
+  :: FilePath      -- Target
+  -> FilePath      -- RC file
+  -> [RawTemplate] -- Commands
+  -> [RawPattern]  -- Patterns
+  -> [RawPattern]  -- Exclude patterns
+  -> IO ()
+main' target rc_file commands patterns excludes = do
   -- Parse .sosrc rules.
-  rc_rules <- parseSosrc optRCFile
+  rc_rules <- parseSosrc rc_file
 
   -- Parse cli rules, where one rule is created per pattern that executes
-  -- each of @optCommands@ sequentially.
+  -- each of @commands@ sequentially.
   cli_rules <- do
-    let patterns, excludes :: [RawPattern]
-        (patterns, excludes) =
-          case (rc_rules, optPatterns) of
+    let patterns', excludes' :: [RawPattern]
+        (patterns', excludes') =
+          case (rc_rules, patterns) of
             -- If there are no commands in .sosrc, and no patterns
             -- specified on the command line, default to ".*"
             ([], []) -> ([".*"], [])
-            _ -> (optPatterns, optExcludes)
+            _ -> (patterns, excludes)
 
-    mapM (\pattrn -> buildRule pattrn excludes optCommands) patterns
+    mapM (\pattrn -> buildRule pattrn excludes' commands) patterns'
 
-  (target, rules) <- do
-    is_dir  <- doesDirectoryExist optTarget
-    is_file <- doesFileExist optTarget
+  (target', rules) <- do
+    is_dir  <- doesDirectoryExist target
+    is_file <- doesFileExist target
     case (is_dir, is_file) of
-      (True, _) -> pure (optTarget, cli_rules ++ rc_rules)
+      (True, _) -> pure (target, cli_rules ++ rc_rules)
       -- If the target is a single file, completely ignore the .sosrc
       -- commands.
       (_, True) -> do
-        rule <- buildRule (packBS optTarget) [] optCommands
-        pure (takeDirectory optTarget, [rule])
+        rule <- buildRule (packBS target) [] commands
+        pure (takeDirectory target, [rule])
       _ -> do
-        putStrLn ("Target " ++ optTarget ++ " is not a file or directory.")
+        putStrLn ("Target " ++ target ++ " is not a file or directory.")
         exitFailure
 
   putStrLn "Hit Ctrl+C to quit."
@@ -121,7 +83,7 @@ main' Options{..} = do
   all_job_events :: TQueue Job <- newTQueueIO
 
   let event_stream :: Stream (Of FileEvent) Managed ()
-      event_stream = watchTree target
+      event_stream = watchTree target'
 
       job_stream :: Stream (Of Job) Managed ()
       job_stream =
@@ -243,7 +205,7 @@ eventCommands rules event = concat <$> mapM go rules
         Nothing -> False
         Just exclude -> match exclude (fileEventPath event)
 
-watchTree :: forall a. FilePath -> Stream (Of FileEvent) Managed a
+watchTree :: FilePath -> Stream (Of FileEvent) Managed a
 watchTree target = do
   cwd <- liftIO getCurrentDirectory
 
