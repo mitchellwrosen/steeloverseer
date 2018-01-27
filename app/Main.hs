@@ -2,58 +2,62 @@
 
 module Main where
 
-import Cli
+import Cli (cliMain)
 import Sos.FileEvent
-import Sos.Job
+  (FileEvent(FileAdded, FileModified), fileEventPath, showFileEvent)
+import Sos.Job (Job(Job, jobEvent), ShellCommand, runJob)
 import Sos.Rule
-import Sos.Template
-import Sos.Utils
+  (RawPattern, RawRule, Rule(ruleExclude, rulePattern, ruleTemplates),
+    buildRawRule, buildRule)
+import Sos.Template (RawTemplate, instantiateTemplate)
+import Sos.Utils (cyan, packBS, red)
 
-import Control.Concurrent.Async
-import Control.Monad.Catch (MonadThrow(..))
-import Control.Monad.STM
+import Control.Concurrent.Async (Async, async, cancel, race_, waitCatchSTM)
+import Control.Monad.Catch (MonadThrow, throwM)
+import Control.Monad.IO.Class (MonadIO, liftIO)
+import Control.Monad.STM (STM, atomically, retry)
+import Control.Monad.Trans.Class (lift)
+import Control.Monad.Trans.Maybe (MaybeT(runMaybeT))
 import Control.Concurrent.STM.TMVar
+  (TMVar, isEmptyTMVar, newEmptyTMVarIO, putTMVar, swapTMVar, takeTMVar,
+    tryReadTMVar)
 import Control.Concurrent.STM.TQueue.Extra
 import Control.Exception
-import Control.Monad
-import Control.Monad.Managed
+  (AsyncException(ThreadKilled), Exception(fromException), SomeException)
+import Control.Monad (forever, join)
+import Control.Monad.Managed.Safe (Managed, managed, runManaged)
 import Data.ByteString (ByteString)
+import Data.Foldable (asum)
 import Data.List.NonEmpty (NonEmpty(..))
-import Data.Monoid
 import Data.Yaml (decodeFileEither, prettyPrintParseException)
-import Streaming
-import System.Directory
-import System.Exit
-import System.FilePath
+import Streaming (Of, Stream)
+import System.Directory (doesDirectoryExist, doesFileExist, getCurrentDirectory)
+import System.Exit (ExitCode(ExitFailure, ExitSuccess), exitFailure)
+import System.FilePath (makeRelative, takeDirectory)
 import Text.Printf (printf)
 import Text.Regex.TDFA (match)
 
 import qualified Streaming.Prelude as S
 import qualified System.FSNotify.Streaming as FSNotify
 
--- The concurrent sources of input to the main worker thread.
-data Input
-  = JobToEnqueue Job
-  | JobToRun Job
-  | JobResult Job (Maybe SomeException)
-
 main :: IO ()
-main = cliMain main'
+main = cliMain main1
 
-main'
+main1
   :: FilePath      -- Target
   -> FilePath      -- RC file
   -> [RawTemplate] -- Commands
   -> [RawPattern]  -- Patterns
   -> [RawPattern]  -- Exclude patterns
   -> IO ()
-main' target rc_file commands patterns excludes = do
+main1 target rc_file commands patterns excludes = do
   -- Parse .sosrc rules.
-  rc_rules <- parseSosrc rc_file
+  rc_rules :: [Rule] <-
+    parseSosrc rc_file
 
   -- Parse cli rules, where one rule is created per pattern that executes
   -- each of @commands@ sequentially.
-  cli_rules <- do
+  cli_rules :: [Rule] <- do
     let patterns', excludes' :: [RawPattern]
         (patterns', excludes') =
           case (rc_rules, patterns) of
@@ -65,119 +69,118 @@ main' target rc_file commands patterns excludes = do
     mapM (\pattrn -> buildRule pattrn excludes' commands) patterns'
 
   (target', rules) <- do
-    is_dir  <- doesDirectoryExist target
-    is_file <- doesFileExist target
-    case (is_dir, is_file) of
-      (True, _) -> pure (target, cli_rules ++ rc_rules)
-      -- If the target is a single file, completely ignore the .sosrc
-      -- commands.
-      (_, True) -> do
-        rule <- buildRule (packBS target) [] commands
-        pure (takeDirectory target, [rule])
-      _ -> do
-        putStrLn ("Target " ++ target ++ " is not a file or directory.")
-        exitFailure
+    is_dir <- doesDirectoryExist target
+    if is_dir
+      then pure (target, cli_rules ++ rc_rules)
+      else do
+        is_file <- doesFileExist target
+        if is_file
+          -- If the target is a single file, completely ignore the .sosrc
+          -- commands.
+          then do
+            rule <- buildRule (packBS target) [] commands
+            pure (takeDirectory target, [rule])
+          else do
+            putStrLn ("Target " ++ target ++ " is not a file or directory.")
+            exitFailure
 
+  main2 target' rules
+
+main2
+  :: FilePath -- Target
+  -> [Rule]   -- Rules
+  -> IO ()
+main2 target rules = do
   putStrLn "Hit Ctrl+C to quit."
 
-  all_job_events :: TQueue Job <- newTQueueIO
+  all_job_events :: TQueue Job
+    <- newTQueueIO
 
-  let event_stream :: Stream (Of FileEvent) Managed ()
-      event_stream = watchTree target'
-
-      job_stream :: Stream (Of Job) Managed ()
-      job_stream =
-        S.for event_stream
-          (\event ->
-            liftIO (eventCommands rules event) >>= \case
-              [] -> pure ()
-              (c:cs) -> S.yield (Job event (c :| cs)))
-
-      enqueue_thread :: Managed ()
+  let enqueue_thread :: Managed ()
       enqueue_thread =
-        S.mapM_ (liftIO . atomically . writeTQueue all_job_events) job_stream
+          watchTree target
+        & S.mapM (eventJob rules)
+        & S.concat
+        & S.mapM_ (liftIO . atomically . writeTQueue all_job_events)
 
-      -- Run jobs forever, only stopping to prompt whether or not to run
-      -- enqueued jobs when a job fails. This way, the failing job's output
-      -- will not be lost by subsequent jobs' outputs without the user's
-      -- consent.
+  let -- Dequeue and run 'Job's forever. If a job fails, empty out the queue
+      -- of jobs to run, so the output of the failed job is not lost.
       dequeue_thread :: IO a
       dequeue_thread = do
         -- Keep track of the subset of all job events to actually run. We don't
         -- want to enqueue already-enqueued jobs, for example - once is enough.
-        jobs_to_run :: TQueue Job <- newTQueueIO
+        jobs_to_run :: TQueue Job
+          <- newTQueueIO
 
-        -- The second concurrent source of input: the result of the currently-
-        -- running job, if any.
-        running_job :: TMVar (Job, Async ()) <- newEmptyTMVarIO
+        -- The currently-running job, paired with its 'Async' to cancel, await,
+        -- or what have you.
+        running_job :: TMVar (Job, Async ()) <-
+          newEmptyTMVarIO
 
         let runJobAsync :: Job -> IO ()
             runJobAsync job = do
-              putStrLn ("\n" <> cyan (showFileEvent (jobEvent job)))
+              putStrLn ("\n" ++ cyan (showFileEvent (jobEvent job)))
               a <- async (runJob job)
               atomically (putTMVar running_job (job, a))
 
         forever $ do
-          let input1 :: STM Input
-              input1 = JobToEnqueue <$> readTQueue all_job_events
+          let -- A job event occurred. If it's equal to the running job, cancel
+              -- it (it will be restarted when we process its ThreadKilled
+              -- result). Otherwise, enqueue it if it doesn't already exist.
+              action1 :: STM (IO ())
+              action1 = do
+                job <- readTQueue all_job_events
+                pure $
+                  atomically (tryReadTMVar running_job) >>= \case
+                    Just (job', a) | job == job' -> do
+                      -- Slightly hacky here: replace the existing job with the
+                      -- new one, because although they contain the same
+                      -- commands, when we restart the job, we want to print
+                      -- the newer 'FileEvent', which may be different.
+                      _ <- atomically (swapTMVar running_job (job, a))
+                      cancel a
+                    _ ->
+                      atomically $
+                        elemTQueue jobs_to_run job >>= \case
+                          True -> pure ()
+                          False -> writeTQueue jobs_to_run job
 
-              input2 :: STM Input
-              input2 = do
+          let action2 :: STM (IO ())
+              action2 = do
                 (job, a) <- takeTMVar running_job
                 result <- waitCatchSTM a
-                pure (JobResult job (either Just (const Nothing) result))
+                pure $
+                  case result of
+                    Left ex ->
+                      case fromException ex of
+                        -- The currently-running job died via ThreadKilled. We
+                        -- will assume we 'canceled' it to restart it.
+                        Just ThreadKilled -> runJobAsync job
 
-              input3 :: STM Input
-              input3 =
+                        -- The currently-running job died via some other means.
+                        -- We don't want the output to get lost, so we'll just
+                        -- empty the job queue for simplicity.
+                        _ -> do
+                          putStrLn (prettyPrintException ex)
+                          atomically (drainTQueue jobs_to_run)
+
+                    -- Job ended successfully!
+                    Right () -> pure ()
+
+          let action3 :: STM (IO ())
+              action3 =
                 isEmptyTMVar running_job >>= \case
-                  True -> JobToRun <$> readTQueue jobs_to_run
+                  True -> runJobAsync <$> readTQueue jobs_to_run
                   False -> retry
 
-          atomically (input1 <|> input2 <|> input3) >>= \case
-            -- A job event occurred. If it's equal to the running job, cancel it
-            -- (it will be restarted when we process its ThreadKilled result).
-            -- Otherwise, enqueue it if it doesn't already exist.
-            JobToEnqueue job ->
-              atomically (tryReadTMVar running_job) >>= \case
-                Just (job', a) | job == job' -> do
-                  -- Slightly hacky here: replace the existing job with the new
-                  -- one, because although they contain the same commands, when
-                  -- we restart the job, we want to print the newer 'FileEvent',
-                  -- which may be different.
-                  _ <- atomically (swapTMVar running_job (job, a))
-                  cancel a
-                _ ->
-                  atomically $
-                    elemTQueue jobs_to_run job >>= \case
-                      True -> pure ()
-                      False -> writeTQueue jobs_to_run job
-
-            JobResult job (Just ex) -> do
-              case fromException ex of
-                -- The currently-running job died via ThreadKilled. We will
-                -- assume we 'canceled' it to restart it.
-                Just ThreadKilled -> runJobAsync job
-
-                -- The currently-running job died via some other means. We don't
-                -- want the output to get lost, so we'll just empty the job
-                -- queue for simplicity.
-                _ -> do
-                  putStrLn (prettyPrintException ex)
-
-                  let exhaustJobsToRun :: STM ()
-                      exhaustJobsToRun =
-                        tryReadTQueue jobs_to_run >>= \case
-                          Nothing -> pure ()
-                          Just _ -> exhaustJobsToRun
-
-                  atomically exhaustJobsToRun
-
-            -- Job ended successfully!
-            JobResult _ Nothing -> pure ()
-
-            JobToRun job -> runJobAsync job
+          join (atomically (asum [action1, action2, action3]))
 
   race_ (runManaged enqueue_thread) dequeue_thread
+
+eventJob :: MonadIO m => [Rule] -> FileEvent -> m (Maybe Job)
+eventJob rules event = runMaybeT $ do
+  c:cs <- lift (liftIO (eventCommands rules event))
+  pure (Job event (c:|cs))
 
 eventCommands :: [Rule] -> FileEvent -> IO [ShellCommand]
 eventCommands rules event = concat <$> mapM go rules
@@ -251,6 +254,10 @@ parseSosrc sosrc = do
                       n -> "Found " ++ show n ++ " rules in " ++ show sosrc)
           pure (concat rules)
     else pure []
+
+infixl 1 &
+(&) :: a -> (a -> b) -> b
+(&) x f = f x
 
 --------------------------------------------------------------------------------
 -- Orphan instances

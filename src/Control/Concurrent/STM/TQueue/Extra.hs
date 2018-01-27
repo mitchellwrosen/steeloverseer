@@ -1,8 +1,15 @@
 -- Source copied from Control.Concurrent.STM.TQueue. Exposes one additional
 -- function (that can't be efficiently implemented with the existing API):
 --
---   elemTQueue :: Eq a => TQueue a -> a -> STM Bool
+-- @
+-- elemTQueue :: Eq a => TQueue a -> a -> STM Bool
+-- @
 --
+-- And one helper-function:
+--
+-- @
+-- drainTQueue :: TQueue a -> STM ()
+-- @
 
 {-# OPTIONS_GHC -fno-warn-name-shadowing #-}
 {-# LANGUAGE CPP, DeriveDataTypeable #-}
@@ -49,7 +56,8 @@ module Control.Concurrent.STM.TQueue.Extra (
         writeTQueue,
         unGetTQueue,
         isEmptyTQueue,
-        elemTQueue
+        elemTQueue,
+        drainTQueue
   ) where
 
 import GHC.Conc
@@ -151,3 +159,10 @@ elemTQueue (TQueue read write) a = do
   xs <- readTVar read
   ys <- readTVar write
   return (elem a xs || elem a ys)
+
+drainTQueue :: TQueue a -> STM ()
+drainTQueue c = do
+  m <- tryReadTQueue c
+  case m of
+    Nothing -> return ()
+    Just _ -> drainTQueue c

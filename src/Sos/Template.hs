@@ -22,20 +22,25 @@ import qualified Data.Text.Lazy.Builder as LText
 
 -- | A 'RawTemplate' represents a shell command, possibly containing capture
 -- groups, e.g. "ghc \0"
-type RawTemplate = ByteString
+type RawTemplate
+  = ByteString
 
--- A 'Template' is a parsed 'RawTemplate' that replaces all capture groups with
--- Lefts.
+-- | A 'Template' is a parsed 'RawTemplate' that replaces all capture groups
+-- with Lefts.
 --
 -- For example, the raw template
 --
---    "gcc -c \1.c -o \1.c"
+-- @
+-- "gcc -c \1.c -o \1.c"
+-- @
 --
 -- will become
 --
---    [Right "gcc -c ", Left 1, Right ".c -o ", Left 1, Right ".c"]
---
-type Template = [Either Int ByteString]
+-- @
+-- [Right "gcc -c ", Left 1, Right ".c -o ", Left 1, Right ".c"]
+-- @
+type Template
+  = [Either Int ByteString]
 
 
 parseTemplate :: MonadThrow m => RawTemplate -> m Template
@@ -56,12 +61,15 @@ parseTemplate raw_template =
     textPart :: ReadP ByteString
     textPart = packBS <$> munch1 (/= '\\')
 
--- Instantiate a template with a list of captured variables, per their indices.
+-- | Instantiate a template with a list of captured variables, per their
+-- indices.
 --
 -- For example,
 --
---    instantiateTemplate ["ONE", "TWO"] [Right "foo", Left 0, Right "bar", Left 1] == "fooONEbarTWO"
---
+-- @
+-- >>> instantiateTemplate ["ONE", "TWO"] [Right "foo", Left 0, Right "bar", Left 1]
+-- "fooONEbarTWO"
+-- @
 instantiateTemplate
   :: forall m. MonadThrow m => [ByteString] -> Template -> m ShellCommand
 instantiateTemplate vars0 template0 = go 0 vars0 template0

@@ -2,7 +2,7 @@
 --
 -- see: https://github.com/sol/hpack
 --
--- hash: 5f428ecdf85f4c8342e9d9208be5daead66e7ab3f2f0b18b4d803e6f0030ed14
+-- hash: 7c48391d189be5be97e6343a80b8971dca6bdcad5d07d628642d02ed67a971ee
 
 name:           steeloverseer
 version:        2.0.2.0
@@ -89,6 +89,7 @@ executable sos
     , stm >=2.4
     , streaming >=0.1.0 && <0.3
     , text >=1.2
+    , transformers <1.1
     , yaml >=0.8
   if os(darwin)
     build-depends:
