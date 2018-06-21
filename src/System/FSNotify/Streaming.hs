@@ -14,20 +14,23 @@ import Control.Concurrent.Chan
 import Control.Exception (bracket)
 import Control.Monad
 import Control.Monad.Managed
-import Streaming
+import Streaming (Of, Stream)
 import Streaming.Prelude (yield)
 import System.FSNotify
 
 watchTree
-  :: WatchConfig -> FilePath -> (Event -> Bool) -> Stream (Of Event) Managed a
-watchTree config path predicate = do
-  chan <- liftIO newChan
+  :: WatchConfig
+  -> FilePath
+  -> (Event -> Bool)
+  -> (Stream (Of Event) IO () -> IO r)
+  -> IO r
+watchTree config path predicate run = do
+  chan :: Chan Event <-
+    newChan
 
-  manager <- lift (managed (withManagerConf config))
-
-  lift (managed_ (withTreeChan manager path predicate chan))
-
-  forever (liftIO (readChan chan) >>= yield)
+  withManagerConf config $ \manager ->
+    withTreeChan manager path predicate chan $
+      run (forever (liftIO (readChan chan) >>= yield))
 
 withTreeChan
   :: WatchManager -> FilePath -> ActionPredicate -> EventChannel -> IO a -> IO a
